@@ -9,14 +9,19 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "transmission.h"
 
-#include "error.h"
 #include "error-types.h"
+#include "error.h"
 #include "file.h"
+#include "metainfo.h"
+#include "platform.h"
 #include "session.h"
+#include "torrent-ctor.h"
 #include "torrent-metainfo.h"
 #include "torrent.h"
 #include "tr-assert.h"
@@ -24,365 +29,355 @@
 
 using namespace std::literals;
 
-struct optional_args
+tr_ctor::tr_ctor(tr_session* session)
+    : session_{ session }
 {
-    std::optional<bool> paused;
-    std::optional<uint16_t> peer_limit;
-    std::string download_dir;
-};
-
-/** Opaque class used when instantiating torrents.
- * @ingroup tr_ctor */
-struct tr_ctor
-{
-    tr_session const* const session;
-    bool saveInOurTorrentsDir = false;
-    std::optional<bool> delete_source;
-
-    tr_priority_t priority = TR_PRI_NORMAL;
-    std::optional<tr_torrent_metainfo> tm;
-
-    struct optional_args optional_args[2];
-
-    std::string source_file;
-    std::string incomplete_dir;
-
-    std::vector<std::byte> contents;
-
-    std::vector<tr_file_index_t> want;
-    std::vector<tr_file_index_t> not_want;
-    std::vector<tr_file_index_t> low;
-    std::vector<tr_file_index_t> normal;
-    std::vector<tr_file_index_t> high;
-
-    std::vector<char> contents;
-
-    explicit tr_ctor(tr_session const* session_in)
-        : session{ session_in }
+    if (session != nullptr)
     {
+        setDeleteSource(tr_sessionGetDeleteSource(session));
+        setPaused(TR_FALLBACK, tr_sessionGetPaused(session));
+        setPeerLimit(TR_FALLBACK, session->peerLimitPerTorrent);
+        setDownloadDir(TR_FALLBACK, tr_sessionGetDownloadDir(session));
     }
-};
-
-/***
-****
-***/
-
-static void clearMetainfo(tr_ctor* ctor)
-{
-    ctor->tm.reset();
-    ctor->source_file.clear();
 }
 
-char const* tr_ctorGetSourceFile(tr_ctor const* ctor)
+void tr_ctor::clearMetainfo()
 {
-    return ctor->source_file.c_str();
+    tm_.reset();
+    source_file_.clear();
 }
 
-bool tr_ctorSetMetainfo(tr_ctor* ctor, void const* benc, size_t benc_len, tr_error** error)
+///
+
+bool tr_ctor::setMetainfo(std::string_view benc, tr_error** error)
 {
-    clearMetainfo(ctor);
+    clearMetainfo();
 
     auto tm = tr_torrent_metainfo{};
-    if (!tm.parseBenc(reinterpret_cast<std::byte const*>(benc), benc_len, error))
+    if (!tm.parseBenc(benc, error))
     {
         return false;
     }
 
-    ctor->tm = std::move(tm);
+    tm_ = std::move(tm);
     return true;
 }
 
-bool tr_ctorSetMetainfoFromMagnetLink(tr_ctor* ctor, char const* magnet_link, tr_error** error)
+bool tr_ctor::setMetainfoFromMagnetLink(std::string_view magnet_link, tr_error** error)
 {
-    if (magnet_link == nullptr)
-    {
-        tr_error_set_literal(error, TR_ERROR_EINVAL, "no magnet link specified");
-        return false;
-    }
-
     auto tm = tr_torrent_metainfo{};
     if (!tm.parseMagnet(magnet_link, error))
     {
         return false;
     }
 
-    ctor->tm = std::move(tm);
+    tm_ = std::move(tm);
     return true;
 }
 
-bool tr_ctorSetMetainfoFromFile(tr_ctor* ctor, char const* filename, tr_error** error)
+bool tr_ctor::setMetainfoFromFile(char const* filename, tr_error** error)
 {
-    if (!tr_loadFile(ctor->contents, filename, error))
+    if (!tr_loadFile(contents_, filename, error))
     {
         return false;
     }
 
-    if (!tr_ctorSetMetainfo(ctor, std::data(ctor->contents), std::size(ctor->contents), error))
+    if (!setMetainfo(std::string_view{ std::data(contents_), std::size(contents_) }, error))
     {
         return false;
     }
 
-    ctor->source_file = filename_sv;
+    source_file_ = filename;
 
     // if no `name' field was set, then set it from the filename
-    if (ctor->tm && std::empty(ctor->tm->name))
+    if (tm_ && std::empty(tm_->name))
     {
         char* base = tr_sys_path_basename(filename, nullptr);
-        ctor->tm->name = base;
+        tm_->name = base;
         tr_free(base);
     }
-}
-
-/***
-****
-***/
-
-void tr_ctorSetFilePriorities(tr_ctor* ctor, tr_file_index_t const* files, tr_file_index_t fileCount, tr_priority_t priority)
-{
-    switch (priority)
-    {
-    case TR_PRI_LOW:
-        ctor->low.assign(files, files + fileCount);
-        break;
-
-    case TR_PRI_HIGH:
-        ctor->high.assign(files, files + fileCount);
-        break;
-
-    default: // TR_PRI_NORMAL
-        ctor->normal.assign(files, files + fileCount);
-        break;
-    }
-}
-
-void tr_ctorInitTorrentPriorities(tr_ctor const* ctor, tr_torrent* tor)
-{
-    for (auto file_index : ctor->low)
-    {
-        tr_torrentInitFilePriority(tor, file_index, TR_PRI_LOW);
-    }
-
-    for (auto file_index : ctor->normal)
-    {
-        tr_torrentInitFilePriority(tor, file_index, TR_PRI_NORMAL);
-    }
-
-    for (auto file_index : ctor->high)
-    {
-        tr_torrentInitFilePriority(tor, file_index, TR_PRI_HIGH);
-    }
-}
-
-void tr_ctorSetFilesWanted(tr_ctor* ctor, tr_file_index_t const* files, tr_file_index_t fileCount, bool wanted)
-{
-    auto& indices = wanted ? ctor->want : ctor->not_want;
-    indices.assign(files, files + fileCount);
-}
-
-void tr_ctorInitTorrentWanted(tr_ctor const* ctor, tr_torrent* tor)
-{
-    tr_torrentInitFileDLs(tor, std::data(ctor->not_want), std::size(ctor->not_want), false);
-    tr_torrentInitFileDLs(tor, std::data(ctor->want), std::size(ctor->want), true);
-}
-
-/***
-****
-***/
-
-void tr_ctorSetDeleteSource(tr_ctor* ctor, bool delete_source)
-{
-    ctor->delete_source = delete_source;
-}
-
-bool tr_ctorGetDeleteSource(tr_ctor const* ctor, bool* setme)
-{
-    auto const& delete_source = ctor->delete_source;
-    if (!delete_source)
-    {
-        return false;
-    }
-
-    if (setme != nullptr)
-    {
-        *setme = *delete_source;
-    }
 
     return true;
 }
 
+///
+
+void tr_ctor::setFilePriorities(tr_file_index_t const* files, tr_file_index_t fileCount, tr_priority_t priority)
+{
+    auto const* walk = files;
+    auto const* const end = walk + fileCount;
+    for (; walk != end; ++walk)
+    {
+        priorities_[*walk] = priority;
+    }
+}
+
+void tr_ctor::setFilesWanted(tr_file_index_t const* files, tr_file_index_t fileCount, bool wanted)
+{
+    auto const* walk = files;
+    auto const* const end = walk + fileCount;
+    for (; walk != end; ++walk)
+    {
+        if (wanted)
+        {
+            not_wanted_.erase(*walk);
+        }
+        else
+        {
+            not_wanted_.insert(*walk);
+        }
+    }
+}
+
+///
+
+void tr_ctor::setDeleteSource(bool delete_source)
+{
+    delete_source_ = delete_source;
+}
+
+bool tr_ctor::getDeleteSource() const
+{
+    return delete_source_ && *delete_source_;
+}
+
 /***
 ****
 ***/
 
-void tr_ctorSetSave(tr_ctor* ctor, bool saveInOurTorrentsDir)
+void tr_ctor::setPaused(tr_ctorMode mode, bool paused)
 {
-    ctor->saveInOurTorrentsDir = saveInOurTorrentsDir;
-}
-
-bool tr_ctorGetSave(tr_ctor const* ctor)
-{
-    return ctor != nullptr && ctor->saveInOurTorrentsDir;
-}
-
-void tr_ctorSetPaused(tr_ctor* ctor, tr_ctorMode mode, bool paused)
-{
-    TR_ASSERT(ctor != nullptr);
     TR_ASSERT(mode == TR_FALLBACK || mode == TR_FORCE);
 
-    ctor->optional_args[mode].paused = paused;
+    optional_args_[mode].paused = paused;
 }
 
-void tr_ctorSetPeerLimit(tr_ctor* ctor, tr_ctorMode mode, uint16_t peer_limit)
+void tr_ctor::setPeerLimit(tr_ctorMode mode, uint16_t peer_limit)
 {
-    TR_ASSERT(ctor != nullptr);
     TR_ASSERT(mode == TR_FALLBACK || mode == TR_FORCE);
 
-    ctor->optional_args[mode].peer_limit = peer_limit;
+    optional_args_[mode].peer_limit = peer_limit;
 }
 
-void tr_ctorSetDownloadDir(tr_ctor* ctor, tr_ctorMode mode, char const* directory)
+void tr_ctor::setDownloadDir(tr_ctorMode mode, char const* directory)
 {
-    TR_ASSERT(ctor != nullptr);
     TR_ASSERT(mode == TR_FALLBACK || mode == TR_FORCE);
 
-    ctor->optional_args[mode].download_dir.assign(directory ? directory : "");
+    optional_args_[mode].download_dir.assign(directory ? directory : "");
 }
 
-void tr_ctorSetIncompleteDir(tr_ctor* ctor, char const* directory)
+void tr_ctor::setIncompleteDir(std::string_view directory)
 {
-    ctor->incomplete_dir.assign(directory ? directory : "");
+    incomplete_dir_.assign(directory);
 }
 
-bool tr_ctorGetPeerLimit(tr_ctor const* ctor, tr_ctorMode mode, uint16_t* setme)
+std::optional<uint16_t> tr_ctor::peerLimit(tr_ctorMode mode) const
 {
-    auto const& peer_limit = ctor->optional_args[mode].peer_limit;
-    if (!peer_limit)
+    return optional_args_[mode].peer_limit;
+}
+
+std::optional<bool> tr_ctor::paused(tr_ctorMode mode) const
+{
+    return optional_args_[mode].paused;
+}
+
+std::optional<std::string_view> tr_ctor::downloadDir(tr_ctorMode mode) const
+{
+    return optional_args_[mode].download_dir;
+}
+
+std::optional<std::string_view> tr_ctor::incompleteDir() const
+{
+    if (std::empty(incomplete_dir_))
     {
+        return {};
+    }
+
+    return incomplete_dir_;
+}
+
+bool tr_ctor::getInfo(tr_info& setme, tr_error** error) const
+{
+    if (!ctor->tm_)
+    {
+        tr_error_set_literal(error, ENODATA, "No metadata to get");
         return false;
     }
 
-    if (setme != nullptr)
+    auto const& src = *this->tm_;
+    auto& tgt = setme;
+
+    tgt.comment = tr_strvDup(src.comment);
+    tgt.creator = tr_strvDup(src.creator);
+    tgt.dateCreated = src.time_created;
+    tgt.isFolder = std::size(src.files) != 1;
+    tgt.isPrivate = src.is_private;
+    tgt.name = tr_strvDup(src.name);
+    tgt.originalName = tr_strvDup(src.name);
+    tgt.pieceCount = src.n_pieces;
+    tgt.pieceSize = src.piece_size;
+    tgt.source = tr_strvDup(src.source);
+    tgt.totalSize = src.total_size;
+
+    std::copy_n(std::data(src.info_hash), std::size(src.info_hash), reinterpret_cast<std::byte*>(tgt.hash));
+
+    auto const hashstr = src.infoHashString();
+    std::copy(std::begin(hashstr), std::end(hashstr), tgt.hashString);
+
+    tgt.webseedCount = std::size(src.webseed_urls);
+    tgt.webseeds = tr_new(char*, tgt.webseedCount);
+    std::transform(
+        std::begin(src.webseed_urls),
+        std::end(src.webseed_urls),
+        tgt.webseeds,
+        [](auto const& url) { return tr_strvDup(url); });
+
+    int tracker_id = 0;
+    tgt.trackerCount = std::size(src.trackers);
+    tgt.trackers = tr_new(tr_tracker_info, tgt.trackerCount);
+    std::transform(
+        std::begin(src.trackers),
+        std::end(src.trackers),
+        tgt.trackers,
+        [&tracker_id](auto const& it)
+        {
+            auto info = tr_tracker_info{};
+            info.tier = it.first;
+            info.announce = tr_strvDup(tr_quark_get_string_view(it.second.announce_url));
+            info.scrape = tr_strvDup(tr_quark_get_string_view(it.second.scrape_url));
+            info.id = ++tracker_id;
+            return info;
+        });
+
+    tgt.fileCount = std::size(src.files);
+    tgt.files = tr_new(tr_file, tgt.fileCount);
+    for (size_t i = 0, n = tgt.fileCount; i < n; ++i)
     {
-        *setme = *peer_limit;
+        auto& in = src.files[i];
+        auto& out = tgt.files[i];
+        out.mtime = 0;
+        out.length = in.size;
+        out.name = tr_strvDup(in.path);
+        out.firstPiece = in.first_piece;
+        out.lastPiece = in.final_piece;
+        out.is_renamed = in.is_renamed;
+        out.dnd = this->not_wanted_.count(i) != 0;
+        auto const it = this->priorities_.find(i);
+        out.priority = it == std::end(this->priorities_) ? TR_PRI_NORMAL : it->second;
     }
+
+    tgt.torrent = session_ != nullptr ?
+        tr_strvDup(tr_buildTorrentFilename(tr_getTorrentDir(session_), &tgt, TR_METAINFO_BASENAME_HASH, ".torrent"sv)) :
+        nullptr;
 
     return true;
 }
 
-bool tr_ctorGetPaused(tr_ctor const* ctor, tr_ctorMode mode, bool* setme)
+tr_session* tr_ctor::session() const
 {
-    auto const& paused = ctor->optional_args[mode].paused;
-    if (!paused)
-    {
-        return false;
-    }
-
-    if (setme != nullptr)
-    {
-        *setme = *paused;
-    }
-
-    return true;
+    return session_;
 }
 
-bool tr_ctorGetDownloadDir(tr_ctor const* ctor, tr_ctorMode mode, char const** setme)
+void tr_ctor::setBandwidthPriority(tr_priority_t priority)
 {
-    auto const& str = ctor->optional_args[mode].download_dir;
-    if (std::empty(str))
+    if (isPriority(priority))
     {
-        return false;
+        priority_ = priority;
     }
-
-    if (setme != nullptr)
-    {
-        *setme = str.c_str();
-    }
-
-    return true;
 }
 
-bool tr_ctorGetIncompleteDir(tr_ctor const* ctor, char const** setme)
+tr_priority_t tr_ctor::bandwidthPriority() const
 {
-    auto const& str = ctor->incomplete_dir;
-    if (std::empty(str))
-    {
-        return false;
-    }
-
-    if (setme != nullptr)
-    {
-        *setme = str.c_str();
-    }
-
-    return true;
+    return priority_;
 }
 
-#if 0
-bool tr_ctorGetMetainfo(tr_ctor const* ctor, tr_variant const** setme)
+std::string_view tr_ctor::contents() const
 {
-    if (!ctor->isSet_metainfo)
-    {
-        return false;
-    }
-
-    if (setme != nullptr)
-    {
-        *setme = &ctor->metainfo;
-    }
-
-    return true;
-}
-#endif
-
-tr_session* tr_ctorGetSession(tr_ctor const* ctor)
-{
-    return const_cast<tr_session*>(ctor->session);
+    return { std::data(contents_), std::size(contents_) };
 }
 
-/***
-****
-***/
+std::string_view tr_ctor::sourceFile() const
+{
+    return source_file_;
+}
 
-static bool isPriority(int i)
+bool tr_ctor::isPriority(int i)
 {
     return i == TR_PRI_LOW || i == TR_PRI_NORMAL || i == TR_PRI_HIGH;
 }
 
-void tr_ctorSetBandwidthPriority(tr_ctor* ctor, tr_priority_t priority)
+/**
+***  C Bindings
+**/
+
+tr_ctor* tr_ctorNew(tr_session* session_or_nullptr)
 {
-    if (isPriority(priority))
-    {
-        ctor->priority = priority;
-    }
-}
-
-tr_priority_t tr_ctorGetBandwidthPriority(tr_ctor const* ctor)
-{
-    return ctor->priority;
-}
-
-/***
-****
-***/
-
-tr_ctor* tr_ctorNew(tr_session const* session)
-{
-    auto* const ctor = new tr_ctor{ session };
-
-    if (session != nullptr)
-    {
-        tr_ctorSetDeleteSource(ctor, tr_sessionGetDeleteSource(session));
-        tr_ctorSetPaused(ctor, TR_FALLBACK, tr_sessionGetPaused(session));
-        tr_ctorSetPeerLimit(ctor, TR_FALLBACK, session->peerLimitPerTorrent);
-        tr_ctorSetDownloadDir(ctor, TR_FALLBACK, tr_sessionGetDownloadDir(session));
-    }
-
-    tr_ctorSetSave(ctor, true);
-    return ctor;
+    return new tr_ctor(session_or_nullptr);
 }
 
 void tr_ctorFree(tr_ctor* ctor)
 {
-    clearMetainfo(ctor);
     delete ctor;
+}
+
+void tr_ctorSetDeleteSource(tr_ctor* ctor, bool do_delete)
+{
+    ctor->setDeleteSource(do_delete);
+}
+
+bool tr_ctorSetMetainfo(tr_ctor* ctor, void const* benc, size_t benc_len, tr_error** error)
+{
+    auto benc_sv = std::string_view{ static_cast<char const*>(benc), benc_len };
+    return ctor->setMetainfo(benc_sv, error);
+}
+
+bool tr_ctorSetMetainfoFromFile(tr_ctor* ctor, char const* filename, tr_error** error)
+{
+    return ctor->setMetainfoFromFile(filename, error);
+}
+
+bool tr_ctorSetMetainfoFromMagnetLink(tr_ctor* ctor, char const* magnet_link, tr_error** error)
+{
+    if (magnet_link == nullptr)
+    {
+        tr_error_set_literal(error, EINVAL, "null argument");
+        return false;
+    }
+
+    return ctor->setMetainfoFromMagnetLink(magnet_link, error);
+}
+
+void tr_ctorSetPeerLimit(tr_ctor* ctor, tr_ctorMode mode, uint16_t limit)
+{
+    ctor->setPeerLimit(mode, limit);
+}
+
+void tr_ctorSetDownloadDir(tr_ctor* ctor, tr_ctorMode mode, char const* directory)
+{
+    ctor->setDownloadDir(mode, directory);
+}
+
+void tr_ctorSetIncompleteDir(tr_ctor* ctor, char const* directory)
+{
+    ctor->setIncompleteDir(directory);
+}
+
+void tr_ctorSetPaused(tr_ctor* ctor, tr_ctorMode mode, bool is_paused)
+{
+    ctor->setPaused(mode, is_paused);
+}
+
+void tr_ctorSetFilePriorities(tr_ctor* ctor, tr_file_index_t const* files, tr_file_index_t file_count, tr_priority_t priority)
+{
+    ctor->setFilePriorities(files, file_count, priority);
+}
+
+void tr_ctorSetFilesWanted(tr_ctor* ctor, tr_file_index_t const* files, tr_file_index_t file_count, bool wanted)
+{
+    ctor->setFilesWanted(files, file_count, wanted);
+}
+
+bool tr_ctorIsMetainfoValid(tr_ctor const* ctor)
+{
+    return !!ctor->metainfo();
 }

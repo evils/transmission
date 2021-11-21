@@ -25,9 +25,7 @@
 
 struct tr_torrent_metainfo : public tr_magnet_metainfo
 {
-    bool parseBenc(std::byte const* benc, size_t benc_len, tr_error** error = nullptr);
-
-    TR_DEPRECATED void setInfo(tr_info& setme) const;
+    bool parseBenc(std::string_view benc, tr_error** error = nullptr);
 
     struct file_t
     {

@@ -182,6 +182,7 @@ set(${PROJECT_NAME}_PRIVATE_HEADERS
     session.h
     stats.h
     subprocess.h
+    torrent-ctor.h
     torrent-magnet.h
     torrent-metainfo.h
     torrent.h

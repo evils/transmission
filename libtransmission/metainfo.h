@@ -23,11 +23,10 @@
 struct tr_error;
 struct tr_variant;
 
-enum tr_metainfo_basename_format
-{
-    TR_METAINFO_BASENAME_NAME_AND_PARTIAL_HASH,
-    TR_METAINFO_BASENAME_HASH
-};
+void tr_metainfoRemoveSaved(tr_session const* session, tr_info const* info);
+
+/** @brief Private function that's exposed here only for unit tests */
+bool tr_metainfoAppendSanitizedPathComponent(std::string& out, std::string_view in, bool* is_adjusted);
 
 struct tr_metainfo_parsed
 {
@@ -56,7 +55,11 @@ struct tr_metainfo_parsed
 
 std::optional<tr_metainfo_parsed> tr_metainfoParse(tr_session const* session, tr_variant const* variant, tr_error** error);
 
-void tr_metainfoRemoveSaved(tr_session const* session, tr_info const* info);
+enum tr_metainfo_basename_format
+{
+    TR_METAINFO_BASENAME_NAME_AND_PARTIAL_HASH,
+    TR_METAINFO_BASENAME_HASH
+};
 
 std::string tr_buildTorrentFilename(
     std::string_view dirname,
@@ -69,6 +72,3 @@ void tr_metainfoMigrateFile(
     tr_info const* info,
     enum tr_metainfo_basename_format old_format,
     enum tr_metainfo_basename_format new_format);
-
-/** @brief Private function that's exposed here only for unit tests */
-bool tr_metainfoAppendSanitizedPathComponent(std::string& out, std::string_view in, bool* is_adjusted);

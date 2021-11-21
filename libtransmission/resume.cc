@@ -22,6 +22,7 @@
 #include "resume.h"
 #include "session.h"
 #include "torrent.h"
+#include "torrent-ctor.h"
 #include "tr-assert.h"
 #include "utils.h"
 #include "variant.h"
@@ -943,27 +944,32 @@ static uint64_t setFromCtor(tr_torrent* tor, uint64_t fields, tr_ctor const* cto
 
     if ((fields & TR_FR_RUN) != 0)
     {
-        auto isPaused = bool{};
-        if (tr_ctorGetPaused(ctor, mode, &isPaused))
+        auto paused = ctor->paused(mode);
+        if (paused)
         {
-            tor->isRunning = !isPaused;
+            tor->isRunning = !*paused;
             ret |= TR_FR_RUN;
         }
     }
 
-    if (((fields & TR_FR_MAX_PEERS) != 0) && tr_ctorGetPeerLimit(ctor, mode, &tor->maxConnectedPeers))
+    if ((fields & TR_FR_MAX_PEERS) != 0)
     {
-        ret |= TR_FR_MAX_PEERS;
+        auto peer_limit = ctor->peerLimit(mode);
+        if (peer_limit)
+        {
+            tor->maxConnectedPeers = *peer_limit;
+            ret |= TR_FR_MAX_PEERS;
+        }
     }
 
     if ((fields & TR_FR_DOWNLOAD_DIR) != 0)
     {
-        char const* path = nullptr;
-        if (tr_ctorGetDownloadDir(ctor, mode, &path) && !tr_str_is_empty(path))
+        auto download_dir = ctor->downloadDir(mode);
+        if (download_dir)
         {
-            ret |= TR_FR_DOWNLOAD_DIR;
             tr_free(tor->downloadDir);
-            tor->downloadDir = tr_strdup(path);
+            tor->downloadDir = tr_strvDup(*download_dir);
+            ret |= TR_FR_DOWNLOAD_DIR;
         }
     }
 

@@ -51,6 +51,7 @@
 #include "subprocess.h"
 #include "torrent-magnet.h"
 #include "torrent.h"
+#include "torrent-ctor.h"
 #include "tr-assert.h"
 #include "trevent.h" /* tr_runInEventThread() */
 #include "utils.h"
@@ -767,11 +768,15 @@ static void callScriptIfEnabled(tr_torrent const* tor, TrScript type)
     }
 }
 
+static void setFileWanted(tr_torrent* tor, tr_file_index_t fileIndex, bool wanted);
+
+#include <iostream> // NOCOMMIT
+
 static void torrentInit(tr_torrent* tor, tr_ctor const* ctor)
 {
     auto const lock = tor->unique_lock();
 
-    tr_session* session = tr_ctorGetSession(ctor);
+    tr_session* session = ctor->session();
     TR_ASSERT(session != nullptr);
 
     static int nextUniqueId = 1;
@@ -785,25 +790,30 @@ static void torrentInit(tr_torrent* tor, tr_ctor const* ctor)
 
     tr_sha1(tor->obfuscatedHash, "req2", 4, tor->info.hash, SHA_DIGEST_LENGTH, nullptr);
 
-    char const* dir = nullptr;
-    if (tr_ctorGetDownloadDir(ctor, TR_FORCE, &dir) || tr_ctorGetDownloadDir(ctor, TR_FALLBACK, &dir))
+    auto download_dir = ctor->downloadDir(TR_FORCE);
+    if (!download_dir)
     {
-        tor->downloadDir = tr_strdup(dir);
+        download_dir = ctor->downloadDir(TR_FALLBACK);
     }
-
-    if (!tr_ctorGetIncompleteDir(ctor, &dir))
+    if (download_dir)
     {
-        dir = tr_sessionGetIncompleteDir(session);
+        tor->downloadDir = tr_strvDup(*download_dir);
     }
 
     if (tr_sessionIsIncompleteDirEnabled(session))
     {
-        tor->incompleteDir = tr_strdup(dir);
+        auto incomplete_dir = ctor->incompleteDir();
+        if (!incomplete_dir)
+        {
+            incomplete_dir = tr_sessionGetIncompleteDir(session);
+        }
+
+        tor->incompleteDir = tr_strvDup(*incomplete_dir);
     }
 
     tor->bandwidth = new Bandwidth(session->bandwidth);
 
-    tor->bandwidth->setPriority(tr_ctorGetBandwidthPriority(ctor));
+    tor->bandwidth->setPriority(ctor->bandwidthPriority());
     tor->error = TR_STAT_OK;
     tor->finishedSeedingByIdle = false;
 
@@ -834,9 +844,15 @@ static void torrentInit(tr_torrent* tor, tr_ctor const* ctor)
     tor->completeness = tr_cpGetStatus(&tor->completion);
     setLocalErrorIfFilesDisappeared(tor);
 
-    tr_ctorInitTorrentPriorities(ctor, tor);
-    tr_ctorInitTorrentWanted(ctor, tor);
-    tr_torrentInitPiecePriorities(tor);
+    // TODO(ckerr): this paragraph is awkward because it's
+    // trying to fit a new workflow into old code.
+    // can tr_torrentInitFilePriority, setFileWanted be udpated to this flow?
+    for (tr_file_index_t i = 0; i < tor->info.fileCount; ++i)
+    {
+        tr_torrentInitFilePriority(tor, i, tor->info.files[i].priority);
+        setFileWanted(tor, i, !tor->info.files[i].dnd);
+    }
+    tr_cpInvalidateDND(&tor->completion);
 
     refreshCurrentDir(tor);
 
@@ -870,19 +886,18 @@ static void torrentInit(tr_torrent* tor, tr_ctor const* ctor)
     bool const isNewTorrent = !tr_sys_path_exists(tor->info.torrent, nullptr);
 
     /* maybe save our own copy of the metainfo */
-    if (tr_ctorGetSave(ctor))
+    std::cerr << __FILE__ << ':' << __LINE__ << " source file [" << ctor->sourceFile() << ']' << std::endl;
+    std::cerr << __FILE__ << ':' << __LINE__ << " torrent dir [" << session->torrentDir << ']' << std::endl;
+    if (!tr_strvStartsWith(ctor->sourceFile(), session->torrentDir))
     {
-        tr_variant const* val = nullptr;
-        if (tr_ctorGetMetainfo(ctor, &val))
+        tr_error* error = nullptr;
+        std::cerr << __FILE__ << ':' << __LINE__ << " saving our own copy" << std::endl;
+        if (!tr_saveFile(ctor->contents(), tor->info.torrent, &error))
         {
-            char const* path = tor->info.torrent;
-            int const err = tr_variantToFile(val, TR_VARIANT_FMT_BENC, path);
-
-            if (err != 0)
-            {
-                tr_torrentSetLocalError(tor, "Unable to save torrent file: %s", tr_strerror(err));
-            }
+            std::cerr << __FILE__ << ':' << __LINE__ << " " << error->message << ' ' << error->code << std::endl;
+            tr_torrentSetLocalError(tor, "Unable to save torrent file: %s (%d)", error->message, error->code);
         }
+        tr_error_clear(&error);
     }
 
     tor->tiers = tr_announcerAddTorrent(tor, onTrackerResponse, nullptr);
@@ -913,30 +928,25 @@ static void torrentInit(tr_torrent* tor, tr_ctor const* ctor)
 
 tr_parse_result tr_torrentParse(tr_ctor const* ctor, tr_info* setmeInfo)
 {
-    tr_variant const* metainfo = nullptr;
-    if (!tr_ctorGetMetainfo(ctor, &metainfo))
+    auto const& metainfo = ctor->metainfo();
+    if (!metainfo)
+    {
+        return TR_PARSE_ERR;
+    }
+    if (tr_block_info::bestBlockSize(metainfo->piece_size) == 0)
     {
         return TR_PARSE_ERR;
     }
 
-    auto hasInfo = bool{};
-    bool const didParse = tr_metainfoParse(session, metainfo, setmeInfo, &hasInfo, dictLength);
-    bool const doFree = didParse && (setmeInfo == &tmp);
-
-    if (!didParse)
+    auto* session = ctor->session();
+    if (session != nullptr && tr_torrentFindFromHash(session, metainfo->info_hash) != nullptr)
     {
-        result = TR_PARSE_ERR;
-    }
-
-    if (didParse && hasInfo && tr_block_info::bestBlockSize(setmeInfo->pieceSize) == 0)
-    {
-        return TR_PARSE_ERR;
+        return TR_PARSE_DUPLICATE;
     }
 
     if (setmeInfo != nullptr)
     {
-        *setmeInfo = parsed->info;
-        parsed->info = {};
+        ctor->getInfo(setmeInfo);
     }
 
     return TR_PARSE_OK;
@@ -2150,9 +2160,9 @@ tr_priority_t* tr_torrentGetFilePriorities(tr_torrent const* tor)
 ***  File DND
 **/
 
-static void setFileDND(tr_torrent* tor, tr_file_index_t fileIndex, bool doDownload)
+static void setFileWanted(tr_torrent* tor, tr_file_index_t fileIndex, bool wanted)
 {
-    bool const dnd = !doDownload;
+    bool const dnd = !wanted;
     tr_file* file = &tor->info.files[fileIndex];
 
     file->dnd = dnd;
